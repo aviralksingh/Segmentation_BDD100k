@@ -1,0 +1,9 @@
+dataset/**
+demoVideo/**
+leftImg8bit/**
+gtFine/**
+segmentation/**
+weights/**
+__MACOSX/**
+*.zip
+*.avi
