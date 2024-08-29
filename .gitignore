@@ -7,3 +7,5 @@ weights/**
 __MACOSX/**
 *.zip
 *.avi
+attention_mask_output/*
+
