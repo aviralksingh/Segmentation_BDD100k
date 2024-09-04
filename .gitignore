@@ -2,10 +2,10 @@ dataset/**
 demoVideo/**
 leftImg8bit/**
 gtFine/**
-segmentation/**
 weights/**
 __MACOSX/**
 *.zip
+*.7z
 *.avi
 output/*
 
