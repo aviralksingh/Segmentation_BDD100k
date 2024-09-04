@@ -3,14 +3,13 @@ import numpy as np
 
 # DL library imports
 import torch
+import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import transforms as pth_transforms
 
 from einops import rearrange
-import segmentation_models_pytorch as smp
 from timm.models.layers import drop_path, trunc_normal_
-
-
 
 class overlap_patch_embed(nn.Module):
     def __init__(self, patch_size, stride, in_chans, embed_dim):
@@ -27,9 +26,9 @@ class overlap_patch_embed(nn.Module):
         x = self.norm(x)
         return x, h, w
 
-
 class efficient_self_attention(nn.Module):
-    def __init__(self, attn_dim, num_heads, dropout_p, sr_ratio):
+
+    def __init__(self, attn_dim, num_heads, dropout_p, sr_ratio, return_attention=False):
         super().__init__()
         assert attn_dim % num_heads == 0, f'expected attn_dim {attn_dim} to be a multiple of num_heads {num_heads}'
         self.attn_dim = attn_dim
@@ -50,6 +49,12 @@ class efficient_self_attention(nn.Module):
         # multiple heads to single `attn_dim` size
         self.proj = nn.Linear(attn_dim, attn_dim)
 
+        self._return_attention = return_attention
+
+    @property
+    def return_attention(self):
+        # Read-only access to the return_attention flag
+        return self._return_attention
 
     def forward(self, x, h, w):
         q = self.q(x)
@@ -72,7 +77,12 @@ class efficient_self_attention(nn.Module):
         x = rearrange(x, 'b m hw c -> b hw (m c)')
         x = self.proj(x)
         x = F.dropout(x, p=self.dropout_p, training=self.training)
-        return x
+
+        attn_output = {'key' : k, 'query' : q, 'value' : v, 'attn' : attn}
+        if self.return_attention:
+            return x, attn_output
+        else:
+            return x
 
 
 class mix_feedforward(nn.Module):
@@ -85,6 +95,7 @@ class mix_feedforward(nn.Module):
         self.conv = nn.Conv2d(hidden_features, hidden_features, (3, 3), padding=(1, 1),
                               bias=True, groups=hidden_features)
         self.dropout_p = dropout_p
+
 
     def forward(self, x, h, w):
         x = self.fc1(x)
@@ -99,25 +110,34 @@ class mix_feedforward(nn.Module):
 
 
 class transformer_block(nn.Module):
-    def __init__(self, dim, num_heads, dropout_p, drop_path_p, sr_ratio):
+    def __init__(self, dim, num_heads, dropout_p, drop_path_p, sr_ratio,return_attention=False):
         super().__init__()
         # One transformer block is defined as :
         # Norm -> self-attention -> Norm -> FeedForward
         # skip-connections are added after attention and FF layers
         self.attn = efficient_self_attention(attn_dim=dim, num_heads=num_heads,
-                    dropout_p=dropout_p, sr_ratio=sr_ratio)
+                    dropout_p=dropout_p, sr_ratio=sr_ratio,return_attention=return_attention)
         self.ffn = mix_feedforward( dim, dim, hidden_features=dim * 4, dropout_p=dropout_p)
 
         self.drop_path_p = drop_path_p
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        self._return_attention = return_attention
+
+    @property
+    def return_attention(self):
+        # Read-only access to the return_attention flag
+        return self._return_attention
 
 
     def forward(self, x, h, w):
         # Norm -> self-attention
         skip = x
         x = self.norm1(x)
-        x = self.attn(x, h, w)
+        if(self.return_attention):
+            x, attn_output = self.attn(x, h, w)
+        else:
+            x = self.attn(x, h, w)
         x = drop_path(x, drop_prob=self.drop_path_p, training=self.training)
         x = x + skip
 
@@ -127,7 +147,7 @@ class transformer_block(nn.Module):
         x = self.ffn(x, h, w)
         x = drop_path(x, drop_prob=self.drop_path_p, training=self.training)
         x = x + skip
-        return x
+        return x, attn_output
 
 class mix_transformer_stage(nn.Module):
     def __init__(self, patch_embed, blocks, norm):
@@ -144,21 +164,165 @@ class mix_transformer_stage(nn.Module):
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         return x
 
+class mix_transformer_stage(nn.Module):
+    def __init__(self, patch_embed, blocks, norm, return_attention=False):
+        super().__init__()
+        self.patch_embed = patch_embed
+        self.blocks = nn.ModuleList(blocks)
+        self.norm = norm
+
+        self._return_attention = return_attention
+
+    @property
+    def return_attention(self):
+        # Read-only access to the return_attention flag
+        return self._return_attention
+
+    def forward(self, x):
+        # patch embedding and store required data
+        stage_output  = {}
+        if(self.return_attention):
+            stage_output['patch_embed_input'] = x
+            x, h, w = self.patch_embed(x)
+            stage_output['patch_embed_h'] = h
+            stage_output['patch_embed_w'] = w
+            stage_output['patch_embed_output'] = x
+
+            for block in self.blocks:
+                x, attn_output = block(x, h, w)
+        else:
+             x, h, w = self.patch_embed(x)
+             for block in self.blocks:
+                 x = block(x, h, w)
+
+        x = self.norm(x)
+        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+
+        # store last attention block data
+        # in stages' output data
+        if(self.return_attention):
+            for k,v in attn_output.items():
+                stage_output[k] = v
+            del attn_output
+            return x, stage_output
+        else:
+            return x
+
+
+class mix_transformer(nn.Module):
+    def __init__(self, in_chans, embed_dims, num_heads, depths,
+                sr_ratios, dropout_p, drop_path_p,return_attention=False):
+        super().__init__()
+        self.stages = nn.ModuleList()
+        for stage_i in range(len(depths)):
+            # Each Stage consists of following blocks :
+            # Overlap patch embedding -> mix_transformer_block -> norm
+            blocks = []
+            for i in range(depths[stage_i]):
+                blocks.append(transformer_block(dim = embed_dims[stage_i],
+                        num_heads= num_heads[stage_i], dropout_p=dropout_p,
+                        drop_path_p = drop_path_p * (sum(depths[:stage_i])+i) / (sum(depths)-1),
+                        sr_ratio = sr_ratios[stage_i],return_attention=return_attention))
+
+            if(stage_i == 0):
+                patch_size = 7
+                stride = 4
+                in_chans = in_chans
+            else:
+                patch_size = 3
+                stride = 2
+                in_chans = embed_dims[stage_i -1]
+
+            patch_embed = overlap_patch_embed(patch_size, stride=stride, in_chans=in_chans,
+                            embed_dim= embed_dims[stage_i])
+            norm = nn.LayerNorm(embed_dims[stage_i], eps=1e-6)
+            self.stages.append(mix_transformer_stage(patch_embed, blocks, norm, return_attention=return_attention))
+
+            self._return_attention = return_attention
+
+    @property
+    def return_attention(self):
+        # Read-only access to the return_attention flag
+        return self._return_attention
+
+
+    def forward(self, x):
+        outputs = []
+        for i,stage in enumerate(self.stages):
+            x, _ = stage(x)
+            outputs.append(x)
+        return outputs
+
+
+    def get_attn_outputs(self, x):
+        stage_outputs = []
+        for i,stage in enumerate(self.stages):
+            x, stage_data = stage(x)
+            stage_outputs.append(stage_data)
+        return stage_outputs
+
+
+class segformer_head(nn.Module):
+    def __init__(self, in_channels, num_classes, embed_dim, dropout_p=0.1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        self.dropout_p = dropout_p
+
+        # 1x1 conv to fuse multi-scale output from encoder
+        self.layers = nn.ModuleList([nn.Conv2d(chans, embed_dim, (1, 1))
+                                     for chans in reversed(in_channels)])
+        self.linear_fuse = nn.Conv2d(embed_dim * len(self.layers), embed_dim, (1, 1), bias=False)
+        self.bn = nn.BatchNorm2d(embed_dim, eps=1e-5)
+
+        # 1x1 conv to get num_class channel predictions
+        self.linear_pred = nn.Conv2d(self.embed_dim, num_classes, kernel_size=(1, 1))
+        self.init_weights()
+
+    def init_weights(self):
+        nn.init.kaiming_normal_(self.linear_fuse.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.constant_(self.bn.weight, 1)
+        nn.init.constant_(self.bn.bias, 0)
+
+    def forward(self, x):
+        feature_size = x[0].shape[2:]
+
+        # project each encoder stage output to H/4, W/4
+        x = [layer(xi) for layer, xi in zip(self.layers, reversed(x))]
+        x = [F.interpolate(xi, size=feature_size, mode='bilinear', align_corners=False)
+             for xi in x[:-1]] + [x[-1]]
+
+        # concatenate project output and use 1x1
+        # convs to get num_class channel output
+        x = self.linear_fuse(torch.cat(x, dim=1))
+        x = self.bn(x)
+        x = F.relu(x, inplace=True)
+        x = F.dropout(x, p=self.dropout_p, training=self.training)
+        x = self.linear_pred(x)
+        return x
+
+
 
 class segformer_mit_b3(nn.Module):
-    def __init__(self, in_channels, num_classes):
+    def __init__(self, in_channels, num_classes, return_attention=False):
         super().__init__()
         # Encoder block
         self.backbone = mix_transformer(in_chans=in_channels, embed_dims=(64, 128, 320, 512),
                                     num_heads=(1, 2, 5, 8), depths=(3, 4, 18, 3),
-                                    sr_ratios=(8, 4, 2, 1), dropout_p=0.0, drop_path_p=0.1)
+                                    sr_ratios=(8, 4, 2, 1), dropout_p=0.0, drop_path_p=0.1,return_attention=return_attention)
         # decoder block
         self.decoder_head = segformer_head(in_channels=(64, 128, 320, 512),
                                     num_classes=num_classes, embed_dim=256)
 
         # init weights
         self.apply(self._init_weights)
+        self._return_attention = return_attention
 
+    @property
+    def return_attention(self):
+        # Read-only access to the return_attention flag
+        return self._return_attention
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -176,5 +340,20 @@ class segformer_mit_b3(nn.Module):
         image_hw = x.shape[2:]
         x = self.backbone(x)
         x = self.decoder_head(x)
-        x = F.interpolate(x, size=image_hw, mode= 'bilinear', align_corners=False)
+        x = F.interpolate(x, size=image_hw, mode='bilinear', align_corners=False)
         return x
+
+
+    def get_attention_outputs(self, x):
+        if(self.return_attention):
+            return self.backbone.get_attn_outputs(x)
+        else:
+            raise ValueError("Retrieving Attention map not enabled")
+
+
+    def get_last_selfattention(self, x):
+        if(self.return_attention):
+            outputs = self.get_attention_outputs(x)
+            return outputs[-1].get('attn', None)
+        else:
+            raise ValueError("Retrieving Attention map not enabled")
