@@ -8,4 +8,4 @@ __MACOSX/**
 *.7z
 *.avi
 output/*
-
+experiments/*

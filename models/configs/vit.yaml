@@ -1,0 +1,14 @@
+model:
+  type: ViTForClassification
+  input_dim: 224
+  num_classes: 10
+  layers:
+    - type: Convolution
+      filters: 64
+      kernel_size: 3
+    - type: Dense
+      units: 128
+
+optimizer:
+  type: Adam
+  learning_rate: 0.001
