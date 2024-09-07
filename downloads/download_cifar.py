@@ -28,7 +28,7 @@ def prepare_data(batch_size=4, num_workers=2, train_sample_size=None, test_sampl
         transforms.Resize((32, 32)),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
-    testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+    testset = torchvision.datasets.CIFAR10(root=root, train=False,
                                         download=True, transform=test_transform)
     if test_sample_size is not None:
         # Randomly sample a subset of the test set
@@ -41,3 +41,4 @@ def prepare_data(batch_size=4, num_workers=2, train_sample_size=None, test_sampl
     classes = ('plane', 'car', 'bird', 'cat',
             'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
     return trainloader, testloader, classes
+

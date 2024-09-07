@@ -10,7 +10,7 @@ sys.path.append(os.path.abspath('./utils'))
 sys.path.append(os.path.abspath('./models'))
 
 from downloads.download_cifar import prepare_data
-from utils.cifar_utils import save_experiment, save_checkpoint
+from utils.model_utils import save_experiment, save_checkpoint
 from utils.yaml_utils import load_yaml_config
 from models.vit import ViTForClassfication
 
